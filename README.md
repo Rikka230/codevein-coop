@@ -15,7 +15,7 @@ CoopNative's addresses are fixed for that build; it checks 16 bytes at every tar
 | Path | What | Needed on |
 |---|---|---|
 | `mods/CoopSeamless` | UE4SS Lua mod: re-host / re-join reconciler, co-op in beaten areas. Switches in `config.txt` | host and guests |
-| `mods/CoopProbe` | UE4SS Lua mod: read-only state log every 0.2 s; tells CoopNative when a spectate window is open | everyone running CoopNative |
+| `mods/CoopProbe` | UE4SS Lua mod: state log every 0.2 s; tells CoopNative when a spectate window is open; spectate camera | everyone running CoopNative |
 | `native/coopnative.c` | C DLL (MinHook detours), loaded by Ultimate ASI Loader. Experiments, all **off** unless enabled | host and guests (for tests) |
 | `tools/` | Read-only analysis: pak v4 reader, Kismet call/arg finders, exe scanners, headless Ghidra scripts | developers |
 
@@ -31,8 +31,10 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    x64) in `Win64` as `winmm.dll`, build `CoopNative.asi` (below) and put it in `Win64\plugins\`. To switch experiments on,
    create `plugins\CoopNative.ini` with any of:
    ```
-   veto_endcoop=1   keep the session when a guest dies in a boss fight (both PCs)
-   rest_in_coop=1   allow resting at a Mistle with a guest connected
+   veto_endcoop=1   keep the session when a player dies for good in a boss fight while another lives (both PCs)
+   spectate_cam=1   while held that way, the dead player's camera follows a living player (CoopProbe)
+   rest_in_coop=1   host only: allow resting at a Mistle with a guest connected (on a guest it crashed the game)
+   group_rest=1     host only, untested: heal every living player when the host rests (CoopProbe)
    ```
    CoopNative writes `plugins\CoopNative.log` on every launch.
 4. Everyone in the group uses the **same matchmaking password**; the automatic search joins the first matching signal.
@@ -47,7 +49,17 @@ Needs [Zig](https://ziglang.org/download/) (0.17 used; its clang cross-compiles 
 ## Status
 
 Works (two PCs): rejoin after guest field death, host death, boss-room death + wipe, boss kill; co-op in beaten areas.
-In progress: `veto_endcoop` and `rest_in_coop` (written, waiting for a two-PC test), spectating, vestige restoration in co-op.
+
+Works (two PCs, experiments):
+- `rest_in_coop`: the host rests at a Mistle with a guest connected; the guest stays. Enemies do not reset yet, and the partner
+  NPC respawns per rest.
+- `veto_endcoop` + `spectate_cam`: a guest who dies for good in a boss fight stays in the host's world and watches the host fight.
+  A wipe still ends the session normally. Two veto points are needed: `EndCooperativeMode` and the small function that actually
+  switches co-op off (`0x14081BDA0`), which a Blueprint-driven death path calls directly. The black screen was the death overlay
+  `WDT_DeathParts`, hidden while spectating. The low-health screen filter and heartbeat still play.
+
+In progress: boss kill while a guest is held (the held guest must replay the vetoed leave so the host's outro can finish; written,
+not tested), a guest resting at a Mistle in the host's world as his own rest, enemy reset on a co-op rest, vestige restoration.
 Not started: guest progression/rewards (see cranebeaker/coop-anything#207), 3+ players, group teleport.
 
 ## Contributing

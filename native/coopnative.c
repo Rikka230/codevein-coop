@@ -32,7 +32,21 @@ static exec_fn g_orig_get_state;
 static volatile LONG g_calls;
 static volatile LONG g_last_state = -1;
 
+// Replay of a vetoed end (session 7): a guest held by the veto never retries leaving, so after a boss kill the host's outro waits
+// for him forever. CoopProbe sends "replay" when the boss rewards arrive and its own character is dead; the vetoed call is then
+// made for real here, on the game thread (Lua polls GetRescueSignalState from it), and only on the same session manager object.
+typedef void (*endcoop_fn)(void *sm);
+static void *volatile g_vetoed_sm;
+static volatile LONG g_vetoed_kind, g_replay_pending;   // kind 1 = SwitchToEndCoop, 2 = EndCooperativeMode
+static endcoop_fn g_orig_end_coop, g_orig_switch_end_coop;
+
 static void detour_get_state(void *context, void *stack, void *result) {
+    if (g_replay_pending && context && context == g_vetoed_sm && InterlockedExchange(&g_replay_pending, 0)) {
+        LONG kind = InterlockedExchange(&g_vetoed_kind, 0);
+        g_vetoed_sm = NULL;
+        logf_("replay: calling the vetoed %s for real", kind == 2 ? "EndCooperativeMode" : "SwitchToEndCoop");
+        if (kind == 2) g_orig_end_coop(context); else g_orig_switch_end_coop(context);
+    }
     g_orig_get_state(context, stack, result);
     InterlockedIncrement(&g_calls);
     if (result) InterlockedExchange(&g_last_state, *(uint8_t *)result);
@@ -70,18 +84,46 @@ static void detour_state_handler(uint8_t *self, uint32_t a2, uint32_t event) {
 // CoopNative.ini has veto_endcoop=1 AND CoopNative.flags reports a spectate window (boss fight, one player dead, one alive)
 // keeps both the request and the state change from happening. Needed on host and guest (each ends co-op on its own side).
 #define ADDR_END_COOP_BODY 0x146E92EF0ULL
-typedef void (*endcoop_fn)(void *sm);
-static endcoop_fn g_orig_end_coop;
 static volatile LONG g_veto_enabled, g_spectate_window;
+
+// Session 7: a boss kill calls EndCooperativeMode ~2 s after MulticastGainRewards; the polled flag was 0.3 s stale and the veto
+// stalled the host's outro on a black screen. Re-read the flag file at the moment of the decision instead.
+static int read_small_file(const char *name, char *buf, size_t size);
+static int window_now(void) {
+    char buf[8];
+    LONG win = read_small_file("CoopNative.flags", buf, sizeof buf) && buf[0] == '1';
+    InterlockedExchange(&g_spectate_window, win);
+    return win;
+}
 
 static void detour_end_coop(void *sm) {
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
-    if (g_veto_enabled && g_spectate_window) {
+    if (g_veto_enabled && window_now()) {
         logf_("EndCooperativeMode from 0x%llX  *** VETOED (spectate window) ***", (unsigned long long)caller);
+        g_vetoed_sm = sm; InterlockedExchange(&g_vetoed_kind, 2);
         return;
     }
     logf_("EndCooperativeMode from 0x%llX (allowed)", (unsigned long long)caller);
     g_orig_end_coop(sm);
+}
+
+// Session 7 (2026-10-27): with the EndCooperativeMode veto on, both sides still ended co-op through 0x14081BDA0 (in .xtls, not
+// Denuvo-moved), the small "switch the internal state to 0x1F" function that EndCooperativeMode has inlined. The guest reached it
+// from a Blueprint-called native (return 0x14633CFA0, after getting the session manager); the host from the session monitor
+// (return 0x146E653C0) once no other player was left. Veto it in the spectate window, except from the monitor: when the other
+// player is really gone, the host must end co-op.
+#define ADDR_SWITCH_END_COOP 0x14081BDA0ULL
+#define CALLER_NO_PLAYERS_LEFT 0x146E653C0ULL
+
+static void detour_switch_end_coop(void *sm) {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    if (g_veto_enabled && caller != CALLER_NO_PLAYERS_LEFT && window_now()) {
+        logf_("SwitchToEndCoop from 0x%llX  *** VETOED (spectate window) ***", (unsigned long long)caller);
+        g_vetoed_sm = sm; InterlockedExchange(&g_vetoed_kind, 1);
+        return;
+    }
+    logf_("SwitchToEndCoop from 0x%llX (allowed)", (unsigned long long)caller);
+    g_orig_switch_end_coop(sm);
 }
 
 // R1 (rest at a Mistle in co-op), off unless CoopNative.ini has rest_in_coop=1. The Mistle's IsActionButtonActive override
@@ -208,6 +250,9 @@ static void run_commands(void) {
         char hex[64 * 3 + 1] = "";
         for (unsigned i = 0; i < b; i++) snprintf(hex + i * 3, 4, "%02X ", ((uint8_t *)(uintptr_t)a)[i]);
         logf_("peek 0x%llX: %s", a, hex);
+    } else if (strncmp(buf, "replay", 6) == 0) {
+        if (g_vetoed_kind) { InterlockedExchange(&g_replay_pending, 1); logf_("replay requested (sm 0x%p)", g_vetoed_sm); }
+        else logf_("replay requested, but nothing was vetoed");
     } else {
         logf_("unknown command: %s", buf);
     }
@@ -264,6 +309,8 @@ static DWORD WINAPI worker(LPVOID unused) {
             "\x40\x53\x48\x83\xEC\x20\x48\x89\xCB\xE8\xA2\xD5\x9A\xF9\x84\xC0", (void *)detour_prompt_block1, (void **)&g_orig_prompt_block1);
     install("EndCooperativeMode", ADDR_END_COOP_BODY,
             "\x40\x53\x48\x83\xEC\x20\x48\x89\xCB\xE8\x82\x03\x99\xF9\x48\x85", (void *)detour_end_coop, (void **)&g_orig_end_coop);
+    install("SwitchToEndCoop", ADDR_SWITCH_END_COOP,
+            "\xC6\x81\xB8\x0A\x00\x00\x01\x48\x63\x81\x90\x0D\x00\x00\x83\xF8", (void *)detour_switch_end_coop, (void **)&g_orig_switch_end_coop);
     // the Denuvo-moved .code region may become executable only after startup: retry every 2 s for 2 minutes
     int handler_ok = 0, tries = 0;
     LONG shown = -2;
