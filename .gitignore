@@ -1,0 +1,10 @@
+build/
+*.asi
+*.lib
+*.pdb
+*.log
+*.flags
+*.cmd
+*.ini
+__pycache__/
+local/

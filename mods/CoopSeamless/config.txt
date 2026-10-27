@@ -1,0 +1,3 @@
+enabled=1
+host=auto
+guest=auto
