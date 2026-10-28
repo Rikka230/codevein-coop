@@ -33,7 +33,14 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    ```
    veto_endcoop=1   keep the session when a player dies for good in a boss fight while another lives (both PCs)
    spectate_cam=1   while held that way, the dead player's camera follows a living player (CoopProbe)
-   rest_in_coop=1   host only: allow resting at a Mistle with a guest connected (on a guest it crashed the game)
+   keep_dying=1     group respawn (both PCs): a guest whose revive window runs out stays in the host's world, his body is
+                    removed, he spectates, and the host's next Mistle rest respawns him next to the host (appear effect)
+   rest_in_coop=1   allow resting at a Mistle with a guest connected (host; on a guest only together with guest_rest)
+   guest_rest=1     guest only: E at a Mistle opens his own Mistle menu instead of the vanilla rest (which asserts on a guest);
+                    switch partner is disabled there; level-up in progress (see Status)
+   levelup_relay=1  host only, research: guest level-up relay (Server_AddExp(0) signal)
+   vestige_menu=1   host only, research: the Mistle menu sees "no signal" so its memory/vestige entries are enabled
+   trace_death=1    log only: native trace of death/fade/spawn UFunctions (diagnostics)
    group_rest=1     host only, untested: heal every living player when the host rests (CoopProbe)
    ```
    CoopNative writes `plugins\CoopNative.log` on every launch.
@@ -58,9 +65,19 @@ Works (two PCs, experiments):
   switches co-op off (`0x14081BDA0`), which a Blueprint-driven death path calls directly. The black screen was the death overlay
   `WDT_DeathParts`, hidden while spectating. The low-health screen filter and heartbeat still play.
 
-In progress: boss kill while a guest is held (the held guest must replay the vetoed leave so the host's outro can finish; written,
-not tested), a guest resting at a Mistle in the host's world as his own rest, enemy reset on a co-op rest, vestige restoration.
-Not started: guest progression/rewards (see cranebeaker/coop-anything#207), 3+ players, group teleport.
+- Boss kill while a guest is held: the held guest replays the vetoed leave, the host's outro plays, the guest is sent home and
+  rejoins (works).
+- `keep_dying` group respawn (works): the final death is vetoed on both PCs (`TryExecuteDeath` 0x140508540 for falls decided on the
+  host, the component death processing 0x14056AC60 for an expired revive window decided on the guest), the true-dead body is removed
+  at once (the partner cannot revive it, the dissolve does not matter), the guest spectates, and the host's next rest spawns him next
+  to the host with `CharacterHelper:RequestPlayerSpawn` and the appear sequence.
+- `guest_rest`: his own Mistle menu opens on E (works); heal sticks; switch partner disabled. Level-up: research in progress (the
+  guest owns his level and haze; his level-up resolved "the player character" to the host's copy on his PC; a redirect and a
+  resync via the join-time sender `SyncAll` 0x140465CA0 are being tested).
+
+In progress: enemy reset on a co-op rest (works once per session), vestige restoration (menu entries enabled; the restoration screen
+still refuses), falls while protected (survive at the bottom; to become an immediate true death), 3+ players, group teleport (vote).
+Guest progression and shared boss rewards: see issue #1 (CoopProgress).
 
 ## Contributing
 
