@@ -3,12 +3,15 @@
 -- Steps 2 and 3, off by default, guest side only, triggered by the boss area's MulticastGainRewards on the guest's own
 -- game (the boss area is a level actor, so the guest has its reward lists and defeat symbol without any network channel):
 --   guest_rewards=1   give the guest the host's BossAreaRewards when the guest list is empty, once per boss (ledger.txt)
---   guest_progress=1  move the guest's main story position up to the boss's defeat symbol, never down
+--   guest_progress=1  move the guest's main story position up to the boss's defeat symbol, never down; also up to the
+--                     host's position when the host publishes it
+--   host_publish=1    (host) send the host's story position to the guests through the game's co-op symbol sync
 -- Both copy every .sav under %LOCALAPPDATA%\CodeVein\Saved\SaveGames to backups\<time>\ before their first write of a
 -- game run, and write nothing if that copy fails. solo_as_guest=1 runs the guest side in solo play, for tests only.
 -- Output: the UE4SS log, plus one line per event in journal.txt next to config.txt.
--- config.txt (read at load): enabled=1 journal=1 guest_rewards=0 guest_progress=0 solo_as_guest=0
--- Status 2026-10-28: step 1 tested in solo; steps 2 and 3 untested (each game call they use was tested on its own from a test-only helper).
+-- config.txt (read at load): enabled=1 journal=1 guest_rewards=0 guest_progress=0 host_publish=0 solo_as_guest=0
+-- Status 2026-10-28: all of it tested in solo play only (steps 2 and 3 and the position channel with solo_as_guest=1,
+-- the channel as a loopback on one PC). Nothing has run in a two-player session yet.
 local TAG = "[CoopProgress] "
 local ROLE_AUTHORITY = 3
 
@@ -18,7 +21,7 @@ local function try(f) local ok, v = pcall(f); if ok then return v end return nil
 local function valid(o) return o ~= nil and try(function() return o:IsValid() end) end
 local function name(o) return try(function() return o:GetFName():ToString() end) or "?" end
 
-local cfg = {enabled = "1", journal = "1", guest_rewards = "0", guest_progress = "0", solo_as_guest = "0"}
+local cfg = {enabled = "1", journal = "1", guest_rewards = "0", guest_progress = "0", host_publish = "0", solo_as_guest = "0"}
 local f = io.open(MOD_DIR .. "\\config.txt", "r")
 if f then
     for line in f:lines() do
@@ -195,17 +198,46 @@ local function giveRewards(area, defeat)
     end
 end
 
--- Step 3: the boss's defeat symbol on the guest's story line, only forward, only for symbols on the main line.
-local function moveProgress(defeat)
-    local target = lineIndex[defeat]
-    if not target then journal("GUEST", defeat .. " is not on the main story line, progress unchanged"); return end
+-- Step 3: a symbol on the guest's story line (a boss's defeat symbol, or the host's position), only forward, only for
+-- symbols on the main line.
+local function moveProgress(symbol)
+    local target = lineIndex[symbol]
+    if not target then journal("GUEST", symbol .. " is not on the main story line, progress unchanged"); return end
     local pos = currentPosition()
     if not pos then journal("GUEST", "position unreadable, progress unchanged"); return end
-    if pos >= target then journal("GUEST", string.format("position %d already at or past %s (%d)", pos, defeat, target)); return end
+    if pos >= target then journal("GUEST", string.format("position %d already at or past %s (%d)", pos, symbol, target)); return end
     if not ensureBackup() then return end
     local ctx = localPawn() or FindFirstOf("BP_AppGameState_C")
-    local ok, err = pcall(function() saveManager():SetGameProgress(defeat, ctx, true) end)
-    journal("GUEST", string.format("progress %d -> %s (%d) %s", pos, defeat, target, ok and "ok" or ("FAILED " .. tostring(err):sub(1, 100))))
+    local ok, err = pcall(function() saveManager():SetGameProgress(symbol, ctx, true) end)
+    journal("GUEST", string.format("progress %d -> %s (%d) %s", pos, symbol, target, ok and "ok" or ("FAILED " .. tostring(err):sub(1, 100))))
+end
+
+-- Host -> guest story position, for progress outside boss kills. The host calls the game's own co-op symbol sync,
+-- ScenarioPlayerComponent:MulticastSetSyncedSymbols(symbols, results), on its character, with the marker below first and
+-- its position second. Solo test 2026-10-28: the call works from Lua, the hook reads both arrays, and it does not change
+-- CheckGameProgress. Whether it reaches the guest's copy of the host's character is untested (needs two PCs).
+local MARKER = "CoopProgress.pos"
+local PUBLISH_S = 10
+local function hostPublishes() return cfg.host_publish == "1" and (role() == "host" or (role() == "solo" and cfg.solo_as_guest == "1")) end
+local lastPublished, lastPublishAt = nil, 0
+local function publishPosition()
+    if not hostPublishes() then return end
+    local pos = currentPosition()
+    if not pos or pos == 0 then return end
+    if pos == lastPublished and os.time() - lastPublishAt < 60 then return end   -- resend every minute for late joiners
+    local p = localPawn()
+    local comp
+    for _, c in ipairs(FindAllOf("ScenarioPlayerComponent") or {}) do
+        if valid(c) and p and name(try(function() return c:GetOwner() end)) == name(p) then comp = c end
+    end
+    if not comp then return end
+    local ok, err = pcall(function() comp:MulticastSetSyncedSymbols({MARKER, line[pos].sym}, {true, true}) end)
+    if ok then
+        if pos ~= lastPublished then journal("HOST", "published position " .. pos .. " " .. line[pos].sym) end
+        lastPublished, lastPublishAt = pos, os.time()
+    else
+        journal("HOST", "publish FAILED " .. tostring(err):sub(1, 100))
+    end
 end
 
 -- Boss kill. Runs on host and guest in co-op, and in solo play (solo tests, 2026-10-28), once per boss phase.
@@ -236,6 +268,35 @@ end)
 -- 2026-10-28): the game sets them natively. They stay as a cheap signal; the flag store itself is diffed below.
 for _, fn in ipairs({"SetGameProgress", "SetGameProgressInt"}) do
     hook("/Script/Extensions.AppSaveManager:" .. fn, function(_, ...) journal("FLAG", fn .. "(" .. args(...) .. ")") end)
+end
+
+-- The game's own co-op symbol sync and Haze RPCs (SDK), logged to learn when vanilla uses them in a two-player session:
+-- the guest asks with ServerSetSyncedSymbols, the host answers everyone with MulticastSetSyncedSymbols (symbols, results).
+for _, fn in ipairs({"ScenarioPlayerComponent:MulticastSetSyncedSymbols", "ScenarioPlayerComponent:ServerSetSyncedSymbols",
+                     "ScenarioPlayerComponent:MulticastFlowDiagramSetSyncedSymbols", "ScenarioPlayerComponent:ServerFlowDiagramSetSyncedSymbols",
+                     "HumanContextComponent:Client_AddExp", "HumanContextComponent:Server_AddExp"}) do
+    hook("/Script/Extensions." .. fn, function(ctx, ...)
+        local parts = {}
+        for _, p in ipairs({...}) do
+            local v = try(function() return p:get() end)
+            local list = {}
+            if type(v) == "userdata" and pcall(function() v:ForEach(function(_, e) list[#list + 1] = text(e:get()) end) end) and #list > 0 then
+                parts[#parts + 1] = "[" .. table.concat(list, ",") .. "]"
+            else
+                parts[#parts + 1] = text(v)
+            end
+        end
+        journal("SYNC", fn:match(":(.+)$") .. "(" .. table.concat(parts, "; ") .. ") on " .. name(try(function() return ctx:get() end)))
+        -- the host's position, published by publishPosition() on the host's PC
+        if fn:find("MulticastSetSyncedSymbols", 1, true) and parts[1] and parts[1]:find("^%[" .. MARKER:gsub("%.", "%%.") .. ",")
+           and isGuestSide() and cfg.guest_progress == "1" then
+            local sym = parts[1]:match("^%[[^,]+,([^,%]]+)")
+            if sym then
+                local ok, err = pcall(moveProgress, sym)
+                if not ok then journal("GUEST", "host position error: " .. tostring(err):sub(1, 120)) end
+            end
+        end
+    end)
 end
 
 -- The flag store (SDK): UGameProgressFlagTable { TMap<FString,int32> ValMap; TMap<FString,bool> BoolMap; ... }.
@@ -312,6 +373,10 @@ LoopAsync(DIFF_S * 1000, function()
         if not ok then log("flag diff error: " .. tostring(err):sub(1, 120)) end
         ok, err = pcall(position)
         if not ok then log("position error: " .. tostring(err):sub(1, 120)) end
+        if os.time() % PUBLISH_S < DIFF_S then
+            ok, err = pcall(publishPosition)
+            if not ok then log("publish error: " .. tostring(err):sub(1, 120)) end
+        end
     end)
     return false
 end)
