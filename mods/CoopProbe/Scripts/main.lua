@@ -707,9 +707,22 @@ local function disableGuestMenuEntries()
         end
     end
 end
+-- tell CoopNative our own HumanContextComponent (for the direct level-up call), written when the menu opens
+local function writeMyComponent()
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    for _, c in ipairs(FindAllOf("HumanContextComponent") or {}) do
+        if valid(c) and valid(mine) and name(try(function() return c:GetOwner() end)) == name(mine) then
+            local a = try(function() return c:GetAddress() end)
+            local f = a and io.open(WIN64 .. "\\plugins\\CoopNative.mycomp", "w")
+            if f then f:write(string.format("%X", a)); f:close(); log(string.format("guest rest: own HumanContextComponent 0x%X handed to CoopNative", a)) end
+        end
+    end
+end
 local function guestRestRequest()
     local f = io.open(RESTREQ, "r"); if not f then return end
     f:close(); os.remove(RESTREQ)
+    pcall(writeMyComponent)
     local opened = openCheckpointMenu(1)
     disableUntil, disabledLogged = os.clock() + 3, false
     menuWatch = opened and true or false
@@ -794,6 +807,18 @@ local function resyncAfterMenu()
 end
 local LVL_STEPS = { 0, 1, 3, 6 }
 local function guestLevelWatch()
+    -- CoopNative writes CoopNative.lvlwatch after a redirected level-up: watch our own HumanContextComponent
+    local wf = io.open(WIN64 .. "\\plugins\\CoopNative.lvlwatch", "r")
+    if wf then
+        wf:close(); os.remove(WIN64 .. "\\plugins\\CoopNative.lvlwatch")
+        local pc = localPC()
+        local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+        for _, c in ipairs(FindAllOf("HumanContextComponent") or {}) do
+            if valid(c) and valid(mine) and name(try(function() return c:GetOwner() end)) == name(mine) then
+                lvlWatch = { a = try(function() return c:GetAddress() end), at = os.clock(), step = 0 }
+            end
+        end
+    end
     if not lvlWatch or not lvlWatch.a then return end
     local due = LVL_STEPS[lvlWatch.step + 1]
     if not due then lvlWatch = nil; return end

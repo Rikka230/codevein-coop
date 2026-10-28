@@ -38,7 +38,7 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    rest_in_coop=1   allow resting at a Mistle with a guest connected (host; on a guest only together with guest_rest)
    guest_rest=1     guest only: E at a Mistle opens his own Mistle menu instead of the vanilla rest (which asserts on a guest);
                     switch partner is disabled there; level-up in progress (see Status)
-   levelup_relay=1  host only, research: guest level-up relay (Server_AddExp(0) signal)
+   levelup_relay=1  host: apply a guest's level-up (sent as Server_AddExp(0) per level) to the host's copy of him
    vestige_menu=1   host only, research: the Mistle menu sees "no signal" so its memory/vestige entries are enabled
    trace_death=1    log only: native trace of death/fade/spawn UFunctions (diagnostics)
    group_rest=1     host only, untested: heal every living player when the host rests (CoopProbe)
@@ -71,9 +71,13 @@ Works (two PCs, experiments):
   host, the component death processing 0x14056AC60 for an expired revive window decided on the guest), the true-dead body is removed
   at once (the partner cannot revive it, the dissolve does not matter), the guest spectates, and the host's next rest spawns him next
   to the host with `CharacterHelper:RequestPlayerSpawn` and the appear sequence.
-- `guest_rest`: his own Mistle menu opens on E (works); heal sticks; switch partner disabled. Level-up: research in progress (the
-  guest owns his level and haze; his level-up resolved "the player character" to the host's copy on his PC; a redirect and a
-  resync via the join-time sender `SyncAll` 0x140465CA0 are being tested).
+- `guest_rest`: his own Mistle menu opens on E; heal sticks; switch partner disabled; **level-up works on both PCs**. How: the
+  guest owns his haze, the host owns the level its copy of him shows (max HP comes from there). On the guest the menu's
+  level-up is replaced by a direct call of the HumanContextIF level-up (0x1405A2E20) on his own component, with the
+  authority-like check 0x140456A00 forced true for his pawn during the call (the level getter otherwise derives the old level
+  from his player data). He then sends `Server_AddExp(0)` once per level; the host sets the level of its copy with the setter
+  (base+0x88) under the same force and recomputes the stats, so his max HP updates. Gifts: unlocking works on his side,
+  equipping still does not (next).
 
 In progress: enemy reset on a co-op rest (works once per session), vestige restoration (menu entries enabled; the restoration screen
 still refuses), falls while protected (survive at the bottom; to become an immediate true death), 3+ players, group teleport (vote).

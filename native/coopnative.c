@@ -89,10 +89,51 @@ static uint8_t detour_level_check(void *iface, int n) {
     }
     return g_orig_level_check(iface, n);
 }
+typedef void *(*getiface_fn)(void *obj, void *cls);   // (also declared with the lvlinfo code below)
+static volatile uintptr_t g_lvlinfo_comp[4];
+static volatile LONG g_lvlinfo_pending;
+// The level getter (base+0x90 = 0x1461074C0) returns the stored level only when 0x140456A00(owner) is true (authority-like);
+// otherwise it derives the level from the player data. The setter (0x14634EB80) stores the new level and writes GetLevel() into
+// the player data, so on the guest it wrote the old, derived level back (update 45). During our direct level-up on this thread
+// answer true for the guest's own pawn, so the new level reaches his player data.
+#define ADDR_IN_CHARGE 0x140456A00ULL
+typedef uint8_t (*incharge_fn)(void *owner);
+static incharge_fn g_orig_in_charge;
+static volatile uintptr_t g_force_in_charge;
+static volatile DWORD g_force_tid;
+static uint8_t detour_in_charge(void *owner) {
+    if (g_force_in_charge && (uintptr_t)owner == g_force_in_charge && GetCurrentThreadId() == g_force_tid) return 1;
+    return g_orig_in_charge(owner);
+}
 static void run_levelup(void) {
     uintptr_t ctx = g_levelup_ctx, pawn = g_levelup_pawn;
     LONG n = InterlockedExchange(&g_levelup_n, 0);   // reset: the relay adds one per Server_AddExp(0)
     if (!ctx || n <= 0) return;
+    if (pawn) {
+        // relay from a guest: ctx is his HumanContextComponent in our world. The message path (0x14099C350) never reached the real
+        // level-up (update 44/45), so call HumanContextIF 0x1405A2E20 directly; the check is bypassed (thread override) because his
+        // copy has no haze here.
+        void *ifcls = ((void *(*)(void))0x140AD6680ULL)();
+        uintptr_t iface = (uintptr_t)((getiface_fn)0x140EBF6A0ULL)((void *)ctx, ifcls);
+        if (iface && readable(iface, 8)) {
+            // update 47 levelled him up on his side (his status showed the new stats) but his max HP bar stayed: the host's copy
+            // still had the old level. Set it here with the setter (base+0x88) while 0x140456A00 is forced true for his pawn (so
+            // the setter's GetLevel uses the new value), then recompute his stats (base+0xB8 -> base+0xA0) like the level-up does;
+            // no haze is spent here, he paid on his side.
+            uintptr_t base = iface - 0x368, bvt = *(uintptr_t *)base;
+            g_force_tid = GetCurrentThreadId(); g_force_in_charge = pawn;
+            int lvl = ((int (*)(void *))*(uintptr_t *)(bvt + 0x90))((void *)base);
+            ((void (*)(void *, int))*(uintptr_t *)(bvt + 0x88))((void *)base, lvl + (int)n);
+            uint64_t st = ((uint64_t (*)(void *))*(uintptr_t *)(bvt + 0xB8))((void *)base);
+            ((void (*)(void *, uint64_t))*(uintptr_t *)(bvt + 0xA0))((void *)base, st);
+            int after = ((int (*)(void *))*(uintptr_t *)(bvt + 0x90))((void *)base);
+            g_force_in_charge = 0;
+            logf_("levelup (host, set): guest component 0x%llX level %d -> %d (stored, read while forced: %d)", (unsigned long long)ctx, lvl,
+                  lvl + (int)n, after);
+            g_lvlinfo_comp[0] = ctx; InterlockedExchange(&g_lvlinfo_pending, 1);
+            return;
+        }
+    }
     if (pawn) { g_override_tid = GetCurrentThreadId(); g_override_player = pawn; }
     uint8_t r = ((levelup_fn)ADDR_LEVEL_UP)((void *)ctx, (int)n);
     g_override_player = 0;
@@ -702,6 +743,41 @@ static uint8_t detour_level_up(void *ctx, int uplevel) {
     // when the host sent Server_AddExp). His own level-up "succeeded" but his level never moved: on his PC 0x141DF4530(ctx, 0) seems
     // to return the host's character, so the level-up went to the host's copy there. Redirect it to his own pawn (the protect list
     // holds his pawn on his PC); CoopProbe's resync after the menu then carries the new level to the host.
+    // update 44: even redirected, the message path reported 1 while neither level nor haze moved on his component. Call the
+    // HumanContextIF level-up 0x1405A2E20(iface, N) directly on his own HumanContextComponent (address from CoopProbe in
+    // CoopNative.mycomp; interface via 0x140EBF6A0(component, HumanContextIF class)).
+    // update 45: called directly on his component the level-up spent his haze but his level stayed: the host owns the level, the
+    // guest owns the haze. So the guest does nothing locally and only asks the host (relay file -> Server_AddExp(0)); the host
+    // runs the real level-up on his copy (run_levelup below).
+    // update 46: the host-side direct level-up did not move his level either (the host's getter derives it too). Now: the direct
+    // call on his own component again, with 0x140456A00 forced true for his pawn during the call (see detour_in_charge).
+    if (g_guest_rest && !g_override_player) {
+        char buf[32];
+        uintptr_t comp = read_small_file("CoopNative.mycomp", buf, sizeof buf) ? (uintptr_t)strtoull(buf, NULL, 16) : 0;
+        if (comp && readable(comp, 8)) {
+            void *ifcls = ((void *(*)(void))0x140AD6680ULL)();
+            uintptr_t iface = (uintptr_t)((getiface_fn)0x140EBF6A0ULL)((void *)comp, ifcls);
+            if (iface && readable(iface, 8)) {
+                uintptr_t me = first_protected();
+                g_force_tid = GetCurrentThreadId(); g_force_in_charge = me;
+                uint8_t r = ((uint8_t (*)(void *, int))0x1405A2E20ULL)((void *)iface, uplevel);
+                g_force_in_charge = 0;
+                logf_("LevelUpPlayer(+%d) on the guest: HumanContextIF level-up called directly on 0x%llX (in charge forced for 0x%llX) -> %u",
+                      uplevel, (unsigned long long)comp, (unsigned long long)me, r);
+                if (r) {   // tell the host so its copy of him gets the level too (max HP is computed there)
+                    char rp[MAX_PATH];
+                    snprintf(rp, sizeof rp, "%sCoopNative.levelup", g_dir);
+                    FILE *rf = _fsopen(rp, "w", _SH_DENYNO);
+                    if (rf) { fprintf(rf, "%d", uplevel); fclose(rf); }
+                }
+                char path[MAX_PATH];
+                snprintf(path, sizeof path, "%sCoopNative.lvlwatch", g_dir);
+                FILE *f = _fsopen(path, "w", _SH_DENYNO);
+                if (f) { fputs("1", f); fclose(f); }
+                return r;
+            }
+        }
+    }
     if (g_guest_rest && !g_override_player) {
         uintptr_t me = first_protected();
         if (me) {
@@ -709,6 +785,10 @@ static uint8_t detour_level_up(void *ctx, int uplevel) {
             uint8_t r = g_orig_level_up(ctx, uplevel);
             g_override_player = 0;
             logf_("LevelUpPlayer(+%d) on the guest, redirected to his own pawn 0x%llX -> %u", uplevel, (unsigned long long)me, r);
+            char path[MAX_PATH];   // let CoopProbe measure his component level over the next seconds
+            snprintf(path, sizeof path, "%sCoopNative.lvlwatch", g_dir);
+            FILE *f = _fsopen(path, "w", _SH_DENYNO);
+            if (f) { fputs("1", f); fclose(f); }
             return r;
         }
     }
@@ -783,6 +863,8 @@ static DWORD WINAPI worker(LPVOID unused) {
                 install(g_trace_name[i], g_trace_addr[i], g_trace_expect[i], g_trace_det[i], (void **)&g_trace_orig[i]);
     }
     for (int i = 0; i < SYNC_N; i++) install(g_sync_name[i], g_sync_addr[i], g_sync_expect[i], g_sync_det[i], (void **)&g_sync_orig[i]);
+    install("InCharge", ADDR_IN_CHARGE,
+            "\xE9\xDB\xEE\x94\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_in_charge, (void **)&g_orig_in_charge);
     install("LevelCheck", ADDR_LEVEL_CHECK,
             "\xE9\x0B\x6B\xD6\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_level_check, (void **)&g_orig_level_check);
     install("GetPlayerCharacter", ADDR_GET_PLAYER_CHAR,
